@@ -1,0 +1,70 @@
+[build-system]
+requires      = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ─────────────────────────────────────────────────────────────────────────────
+[project]
+name        = "swarm-supervisor"
+version     = "1.0.0"
+description = "Karpathy-style AutoResearcher — turn one idea into 7 parallel Qwen Code agent prompts"
+readme      = "README.md"
+license     = "MIT"
+authors     = [{ name = "Plex Hedge", email = "hello@plexhedge.com" }]
+keywords    = [
+    "ai", "agents", "automation", "qwen", "supervisor",
+    "code-generation", "llm", "anthropic", "swarm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Utilities",
+]
+requires-python = ">=3.9"
+
+dependencies = [
+    "rich>=13.0.0",
+    "anthropic>=0.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build",
+    "twine",
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+[project.scripts]
+supervisor = "swarm_supervisor.cli:main"
+
+# ─────────────────────────────────────────────────────────────────────────────
+[project.urls]
+Homepage      = "https://github.com/plexhedge/swarm-supervisor"
+Repository    = "https://github.com/plexhedge/swarm-supervisor"
+"Bug Tracker" = "https://github.com/plexhedge/swarm-supervisor/issues"
+
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.setuptools]
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["swarm_supervisor*"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["swarm_supervisor"]
