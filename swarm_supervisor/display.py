@@ -1,13 +1,14 @@
 """
-display.py — Enhanced Rich CLI components for swarm-supervisor.
+display.py — Rich CLI components for swarm-supervisor.
 
-All terminal output flows through this module so the rest of the
-codebase stays clean of print() noise.
+All terminal output flows through this module so the rest of the codebase
+stays clean of print() noise. Every function has a plain-text fallback so
+the tool still works with Rich uninstalled (and so tests can import the
+package without it).
 """
 
 from __future__ import annotations
 
-import sys
 from typing import Optional
 
 from . import __version__
@@ -21,12 +22,9 @@ try:
     from rich.text import Text
     from rich.align import Align
     from rich.progress import (
-        Progress, SpinnerColumn, TextColumn,
-        BarColumn, TimeElapsedColumn,
+        Progress, SpinnerColumn, TextColumn, TimeElapsedColumn,
     )
     from rich.markdown import Markdown
-    from rich.columns import Columns
-    from rich.padding import Padding
     from rich import box as rbox
     RICH = True
 except ImportError:
@@ -35,18 +33,18 @@ except ImportError:
 # ── Singleton console ─────────────────────────────────────────────────────────
 console = Console(highlight=False, stderr=False) if RICH else None
 
-# ── Per-agent color palette (7 distinct colors) ───────────────────────────────
-_AGENT_COLORS = [
-    ("bold cyan",    "cyan"),
-    ("bold green",   "green"),
-    ("bold yellow",  "yellow"),
-    ("bold magenta", "magenta"),
-    ("bold blue",    "blue"),
-    ("bold red",     "red"),
-    ("bold white",   "white"),
+# ── Palette cycled across however many tasks exist (not fixed at 7) ──────────
+_TASK_COLORS = [
+    ("bold cyan", "cyan"), ("bold green", "green"), ("bold yellow", "yellow"),
+    ("bold magenta", "magenta"), ("bold blue", "blue"), ("bold red", "red"),
+    ("bold white", "white"),
 ]
 
-_AGENT_ICONS = ["①", "②", "③", "④", "⑤", "⑥", "⑦"]
+_VERDICT_STYLE = {
+    "SAFE":     ("green",  "✓"),
+    "RISKY":    ("yellow", "⚠"),
+    "CONFLICT": ("red",    "✗"),
+}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -66,29 +64,24 @@ _ASCII_LOGO = r"""
 def print_banner() -> None:
     """Print the opening banner."""
     if not RICH:
-        _plain("""
+        _plain(f"""
 ╔══════════════════════════════════════════════════════════╗
-║   SUPERVISOR  ·  Karpathy AutoResearcher  v{v}        ║
-║   7-Agent Qwen Code Swarm Controller                     ║
+║   SUPERVISOR  ·  Task Decomposition + Verification  v{__version__:<8}║
+║   Agent-agnostic. Codebase-aware. Conflict-checked.       ║
 ╚══════════════════════════════════════════════════════════╝
-""".format(v=__version__))
+""")
         return
 
     logo = Text(_ASCII_LOGO, style="bold cyan", justify="center")
     sub = Text(
-        f"  Karpathy AutoResearcher  ·  7-Agent Qwen Code Swarm  ·  v{__version__}  ",
+        f"  Task decomposition + dependency-graph verification  ·  v{__version__}  ",
         style="bold white",
         justify="center",
     )
     console.print()
     console.print(Align.center(logo))
     console.print(
-        Panel(
-            Align.center(sub),
-            border_style="cyan",
-            box=rbox.HEAVY,
-            padding=(0, 0),
-        )
+        Panel(Align.center(sub), border_style="cyan", box=rbox.HEAVY, padding=(0, 0))
     )
     console.print()
 
@@ -151,14 +144,6 @@ def blank() -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def make_spinner(label: str = "Working…"):
-    """
-    Returns a Rich Progress spinner as a context manager.
-    Usage:
-        with make_spinner("Scanning...") as p:
-            t = p.add_task("")
-            ... do work ...
-    Falls back to a no-op context manager when Rich is unavailable.
-    """
     if RICH:
         return Progress(
             SpinnerColumn(spinner_name="dots12", style="bold cyan"),
@@ -194,16 +179,13 @@ class _NullProgress:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def display_idea(idea: str) -> None:
-    """Render the user's idea in a prominent panel."""
     if RICH:
         console.print()
         console.print(
             Panel(
                 Align.center(Text(f'"{idea}"', style="bold white italic")),
                 title="[bold cyan]🎯  YOUR IDEA[/bold cyan]",
-                border_style="cyan",
-                box=rbox.DOUBLE,
-                padding=(1, 4),
+                border_style="cyan", box=rbox.DOUBLE, padding=(1, 4),
             )
         )
         console.print()
@@ -211,27 +193,21 @@ def display_idea(idea: str) -> None:
         _plain(f'\n🎯 IDEA: "{idea}"\n')
 
 
-def display_scan_stats(
-    file_tree: list,
-    file_contents: dict,
-    function_map: dict,
-    total_chars: int,
-    project_dir: str,
-) -> None:
-    """Show a compact scan-results card."""
+def display_scan_stats(file_tree: list, file_contents: dict, function_map: dict,
+                        total_chars: int, project_dir: str) -> None:
     if not RICH:
-        _plain(f"  ✓ {len(file_tree)} files found · {len(file_contents)} read · {total_chars:,} chars · {len(function_map)} Python modules mapped")
+        _plain(f"  ✓ {len(file_tree)} files found · {len(file_contents)} read · "
+               f"{total_chars:,} chars · {len(function_map)} Python modules mapped")
         return
 
     table = Table(box=rbox.SIMPLE, show_header=False, padding=(0, 2))
     table.add_column("key", style="dim white")
     table.add_column("val", style="bold white")
-
-    table.add_row("Project",         str(project_dir))
-    table.add_row("Files found",     str(len(file_tree)))
-    table.add_row("Files read",      str(len(file_contents)))
-    table.add_row("Chars indexed",   f"{total_chars:,}")
-    table.add_row("Python modules",  str(len(function_map)))
+    table.add_row("Project", str(project_dir))
+    table.add_row("Files found", str(len(file_tree)))
+    table.add_row("Files read", str(len(file_contents)))
+    table.add_row("Chars indexed", f"{total_chars:,}")
+    table.add_row("Python modules", str(len(function_map)))
 
     console.print(
         Panel(table, title="[bold green]📁  CODEBASE INDEXED[/bold green]",
@@ -240,153 +216,163 @@ def display_scan_stats(
     console.print()
 
 
-def display_plan_overview(plan_text: str) -> None:
-    """Render the AUTO-RESEARCHER PLAN section."""
-    # Extract only the plan block
-    plan_block = _extract_section(plan_text, "=== AUTO-RESEARCHER PLAN ===", "===")
-    if not plan_block:
-        plan_block = plan_text[:800]
+def display_verification(report) -> None:
+    """Render a ConflictReport (verifier.ConflictReport)."""
+    style, icon = _VERDICT_STYLE.get(report.verdict, ("white", "•"))
 
-    if RICH:
-        console.print()
-        rule("EXECUTION PLAN", style="cyan")
-        console.print(Markdown(plan_block))
-        console.print()
-    else:
-        _plain("\n=== EXECUTION PLAN ===")
-        _plain(plan_block)
+    if not RICH:
+        _plain(f"\n=== DEPENDENCY-GRAPH VERIFICATION ===")
+        _plain(f"  {icon} {report.verdict}  (score {report.score}/100)")
+        if report.direct_conflicts:
+            _plain(f"  ✗ {len(report.direct_conflicts)} direct file conflict(s):")
+            for c in report.direct_conflicts:
+                _plain(f"      {c['file']} — claimed by {', '.join(c['tasks'])}")
+        if report.coupling_risks:
+            _plain(f"  ⚠ {len(report.coupling_risks)} cross-task coupling edge(s)")
+        if report.hotspot_hits:
+            _plain(f"  ⚠ {len(report.hotspot_hits)} shared-surface file(s) touched by multiple tasks")
         _plain("")
+        return
+
+    lines = [f"[bold {style}]{icon} {report.verdict}[/bold {style}]  ·  score {report.score}/100"]
+    if report.direct_conflicts:
+        lines.append(f"[bold red]{len(report.direct_conflicts)} direct file conflict(s):[/bold red]")
+        for c in report.direct_conflicts:
+            lines.append(f"  [red]·[/red] `{c['file']}` claimed by {', '.join(c['tasks'])}")
+    if report.coupling_risks:
+        lines.append(f"[yellow]{len(report.coupling_risks)} cross-task coupling edge(s)[/yellow] "
+                      f"(imports/calls spanning two tasks' files)")
+    if report.hotspot_hits:
+        lines.append(f"[yellow]{len(report.hotspot_hits)} shared-surface file(s) touched by "
+                      f"multiple tasks:[/yellow]")
+        for h in report.hotspot_hits:
+            lines.append(f"  [yellow]·[/yellow] `{h['file']}` — tasks {', '.join(h['tasks'])}")
+    for n in report.notes:
+        lines.append(f"[dim]· {n}[/dim]")
+
+    console.print()
+    console.print(
+        Panel("\n".join(lines), title="[bold cyan]🔗  DEPENDENCY-GRAPH VERIFICATION[/bold cyan]",
+              border_style=style, box=rbox.ROUNDED, padding=(1, 2))
+    )
+    console.print()
 
 
-def display_agent_cards(prompts: list[str]) -> None:
-    """Render each agent in its own color-coded panel."""
-    if not prompts:
-        warn("No agent prompts found in the generated plan.")
+def display_task_cards(plan) -> None:
+    """Render each task in its own color-coded panel (any task count)."""
+    if not plan.tasks:
+        warn("No tasks found in the generated plan.")
         return
 
     if RICH:
         console.print()
-        rule("7 AGENT PROMPTS  ·  COPY-PASTE INTO QWEN CODE", style="cyan")
+        rule(f"{len(plan.tasks)} TASK{'S' if len(plan.tasks) != 1 else ''} — COPY INTO YOUR AGENT/ORCHESTRATOR OF CHOICE", style="cyan")
         console.print()
     else:
         _plain("\n" + "="*70)
-        _plain("7 AGENT PROMPTS — COPY INTO QWEN CODE")
+        _plain(f"{len(plan.tasks)} TASKS")
         _plain("="*70)
 
-    for i, prompt in enumerate(prompts, 1):
-        fg, border = _AGENT_COLORS[(i - 1) % 7]
-        icon = _AGENT_ICONS[(i - 1) % 7]
-
-        lines      = prompt.strip().splitlines()
-        header     = lines[0].strip() if lines else f"AGENT {i}"
-        body       = "\n".join(lines[1:]).strip() if len(lines) > 1 else prompt
+    for i, t in enumerate(plan.tasks, 1):
+        fg, border = _TASK_COLORS[(i - 1) % len(_TASK_COLORS)]
+        body = t.description or "(no description)"
+        if t.target_files:
+            body += f"\n\nFiles: {', '.join(t.target_files)}"
+        if t.avoid_files:
+            body += f"\nDo not touch: {', '.join(t.avoid_files)}"
+        if t.depends_on:
+            body += f"\nDepends on: {', '.join(t.depends_on)}"
+        if t.acceptance_criteria:
+            body += "\nAcceptance criteria:\n" + "\n".join(f"  - {a}" for a in t.acceptance_criteria)
 
         if RICH:
             console.print(
-                Panel(
-                    Text(body, style="white"),
-                    title=f"[{fg}] {icon}  {header} [/{fg}]",
-                    border_style=border,
-                    box=rbox.ROUNDED,
-                    padding=(1, 2),
-                )
+                Panel(Text(body, style="white"),
+                      title=f"[{fg}] {t.id}  {t.title} [/{fg}]",
+                      border_style=border, box=rbox.ROUNDED, padding=(1, 2))
             )
             console.print()
         else:
             _plain(f"\n{'─'*70}")
-            _plain(f" {icon}  {header}")
+            _plain(f" {t.id}  {t.title}")
             _plain("─"*70)
             _plain(body)
 
 
-def display_summary_table(prompts: list[str]) -> None:
-    """Compact table listing all 7 agents and their roles."""
+def display_summary_table(plan) -> None:
     if not RICH:
         return
+    table = Table(title="[bold cyan]Task Roster[/bold cyan]", box=rbox.ROUNDED,
+                  border_style="cyan", show_lines=True, padding=(0, 1))
+    table.add_column("ID", style="bold cyan", width=6, justify="center")
+    table.add_column("Title", style="bold white", min_width=20)
+    table.add_column("Files", style="dim white", min_width=16)
+    table.add_column("Depends on", style="dim white", width=14, justify="center")
 
-    table = Table(
-        title="[bold cyan]Agent Roster[/bold cyan]",
-        box=rbox.ROUNDED,
-        border_style="cyan",
-        show_lines=True,
-        padding=(0, 1),
-    )
-    table.add_column("#",    style="bold cyan",  width=4,  justify="center")
-    table.add_column("Icon", style="bold white", width=4,  justify="center")
-    table.add_column("Role", style="bold white", min_width=24)
-    table.add_column("Status", style="bold green", width=10, justify="center")
-
-    for i, prompt in enumerate(prompts, 1):
-        fg, _ = _AGENT_COLORS[(i - 1) % 7]
-        icon  = _AGENT_ICONS[(i - 1) % 7]
-        lines = prompt.strip().splitlines()
-        first = lines[0] if lines else f"AGENT {i}"
-        # Strip markdown bold / "AGENT N - " prefix
-        role = first.replace(f"**AGENT {i} - ", "").replace("**", "").strip()
-        table.add_row(str(i), f"[{fg}]{icon}[/{fg}]", role, "[green]✓ READY[/green]")
+    for t in plan.tasks:
+        files = ", ".join(t.target_files[:3]) + (" …" if len(t.target_files) > 3 else "")
+        table.add_row(t.id, t.title, files or "—", ", ".join(t.depends_on) or "—")
 
     console.print()
     console.print(Align.center(table))
     console.print()
 
 
-def display_instructions(saved_path: Optional[str] = None) -> None:
-    """Final CTA panel."""
+def display_instructions(tasks_md_path: Optional[str] = None, json_path: Optional[str] = None) -> None:
     items = [
-        "Open [bold cyan]7 Qwen Code windows[/bold cyan] simultaneously",
-        "Paste [bold white]one prompt per window[/bold white] — they are non-overlapping",
-        "Run all 7 in [bold green]parallel[/bold green]",
-        "Collect diffs → run [bold yellow]supervisor --iterate[/bold yellow] for round 2",
+        "Feed [bold white]tasks.md[/bold white] into your agent orchestrator of choice "
+        "(Claude Code, Vibe Kanban, Claude Squad, Conductor, ccswarm, or run each task by hand)",
+        "Tasks in the same wave are marked [bold cyan][P][/bold cyan] — safe to run in parallel",
+        "Run [bold yellow]supervisor verify[/bold yellow] again on any edited plan before executing it",
+        "Collect results → run [bold yellow]supervisor --iterate[/bold yellow] for the next round",
     ]
-    if saved_path:
-        items.append(f"Plan saved → [dim]{saved_path}[/dim]")
+    if tasks_md_path:
+        items.append(f"tasks.md saved → [dim]{tasks_md_path}[/dim]")
+    if json_path:
+        items.append(f"plan.json saved → [dim]{json_path}[/dim]")
 
     if RICH:
         content = "\n".join(f"  [dim]›[/dim] {item}" for item in items)
         console.print(
-            Panel(
-                content,
-                title="[bold yellow]📋  NEXT STEPS[/bold yellow]",
-                border_style="yellow",
-                box=rbox.ROUNDED,
-                padding=(1, 2),
-            )
-        )
-        console.print()
-        console.print(
-            Align.center(
-                Panel(
-                    Align.center(
-                        Text("⚡  SUPERVISOR DONE. FEED THE PROMPTS. SHIP THE CODE.  ⚡",
-                             style="bold cyan")
-                    ),
-                    border_style="cyan",
-                    box=rbox.HEAVY,
-                    padding=(0, 2),
-                )
-            )
+            Panel(content, title="[bold yellow]📋  NEXT STEPS[/bold yellow]",
+                  border_style="yellow", box=rbox.ROUNDED, padding=(1, 2))
         )
         console.print()
     else:
         _plain("\n📋 NEXT STEPS:")
         for item in items:
             _plain(f"  › {item}")
-        _plain("\n⚡  SUPERVISOR DONE. FEED THE PROMPTS. SHIP THE CODE.\n")
+        _plain("")
 
 
 def display_iteration_instructions() -> None:
     if RICH:
         console.print(
             Panel(
-                "  [bold white]Paste the output from ALL 7 agents below.[/bold white]\n"
+                "  [bold white]Paste the results from this round's tasks below[/bold white]\n"
+                "  (diffs, summaries — whatever your agents/orchestrator produced).\n"
                 "  When done, type [bold yellow]END[/bold yellow] on a new line and press Enter.",
-                title="[bold yellow]⟳  AGENT RESULTS INPUT[/bold yellow]",
-                border_style="yellow",
-                padding=(1, 2),
+                title="[bold yellow]⟳  TASK RESULTS INPUT[/bold yellow]",
+                border_style="yellow", padding=(1, 2),
             )
         )
     else:
-        _plain("\n>>> Paste all 7 agent outputs. Type END on a new line when done:\n")
+        _plain("\n>>> Paste this round's task results. Type END on a new line when done:\n")
+
+
+def display_plan_summary(plan) -> None:
+    """Short markdown-ish summary (idea + integration notes) shown before the task cards."""
+    if RICH:
+        console.print()
+        rule("PLAN OVERVIEW", style="cyan")
+        console.print(Markdown(f"**Idea:** {plan.idea}\n\n{plan.integration_notes or ''}"))
+        console.print()
+    else:
+        _plain("\n=== PLAN OVERVIEW ===")
+        _plain(f"Idea: {plan.idea}")
+        if plan.integration_notes:
+            _plain(plan.integration_notes)
+        _plain("")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -395,20 +381,3 @@ def display_iteration_instructions() -> None:
 
 def _plain(msg: str) -> None:
     print(msg)
-
-
-def _extract_section(text: str, start_marker: str, end_marker: str) -> str:
-    """Return text between start_marker line and next line starting with end_marker."""
-    lines  = text.splitlines()
-    inside = False
-    out    = []
-    for line in lines:
-        if not inside:
-            if line.strip().startswith(start_marker):
-                inside = True
-                out.append(line)
-        else:
-            if line.strip().startswith(end_marker) and line.strip() != start_marker:
-                break
-            out.append(line)
-    return "\n".join(out).strip()

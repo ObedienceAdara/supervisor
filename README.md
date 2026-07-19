@@ -1,6 +1,8 @@
 # swarm-supervisor
 
-> **Karpathy-style AutoResearcher** — scan your codebase, think like an architect, generate 7 parallel Qwen Code agent prompts in seconds.
+**Agent-agnostic task decomposition + dependency-graph conflict verification
+for AI coding agents.**
+
 
 ```
  ░██████╗██╗   ██╗██████╗ ███████╗██████╗ ██╗   ██╗██╗███████╗ ██████╗ ██████╗ 
@@ -11,23 +13,43 @@
  ╚═════╝  ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝         ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝
 ```
 
-[![PyPI version](https://img.shields.io/pypi/v/swarm-supervisor.svg)](https://pypi.org/project/swarm-supervisor/)
-[![Python](https://img.shields.io/pypi/pyversions/swarm-supervisor.svg)](https://pypi.org/project/swarm-supervisor/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Turn a feature idea and a codebase into a task plan that's actually checked
+for conflicts — not just split by an LLM's best guess — and use it with
+whatever agent or orchestrator you already run: Claude Code, Vibe Kanban,
+Claude Squad, Conductor, ccswarm, or plain human hands across a few
+terminal windows.
+
+```
+supervisor "Add rate limiting to the /upload endpoint"
+```
+
+That's it. No fixed task count, no target-tool lock-in.
 
 ---
 
-## What it does
+## What changed in v2
 
-You type **one idea**. Supervisor:
+v1 of this tool always produced *exactly 7* prompts, hardcoded for pasting
+into *Qwen Code* specifically. That was a narrow, single-tool niche in an
+ecosystem that has since filled up with general-purpose orchestrators and
+official spec-driven standards (GitHub's Spec-Kit, the AGENTS.md standard).
 
-1. **Scans your codebase** — builds a file tree, reads contents, extracts Python symbols with AST.
-2. **Calls an LLM** (Claude or Groq) with the full codebase context + your idea.
-3. **Generates 7 non-overlapping macro tasks** — no merge conflicts by design.
-4. **Outputs 7 copy-paste-ready prompts** — one per Qwen Code agent window.
-5. **Saves a timestamped Markdown plan** to your current folder.
+v2 narrows to the one thing that ecosystem still doesn't do well:
+**verifying that a proposed task split is actually independent**, using a
+real dependency graph built from your code — not an LLM's prose promise
+that it "won't touch" a file.
 
-Run all 7 agents in parallel → collect diffs → run `supervisor --iterate` for round 2.
+- No fixed task count — plans adapt from 1 to ~10 tasks based on scope.
+- No tool name baked into output — plans render as a Spec-Kit-style
+  `tasks.md`, or as JSON any orchestrator can consume.
+- A real dependency graph (Python import/call resolution + JS/TS relative
+  import resolution) scores every plan for direct file conflicts, cross-task
+  coupling, and shared "hotspot" files — before you run anything.
+- Ships as a CLI **and** an MCP server, so the same verification is callable
+  by Claude Code, Vibe Kanban, or any other MCP-capable client directly.
+- `supervisor verify` works standalone — hand it a task plan from *any*
+  source (not just this tool) and get a conflict report back. No API key
+  required for verification; it's local static analysis.
 
 ---
 
@@ -35,210 +57,145 @@ Run all 7 agents in parallel → collect diffs → run `supervisor --iterate` fo
 
 ```bash
 pip install swarm-supervisor
+# or, to also use it as an MCP server:
+pip install swarm-supervisor[mcp]
 ```
 
-> **Note:** The `supervisor` command may conflict with the `supervisor` process manager (`supervisord`) if you have it installed. If so, use the full path or a virtual environment.
-
----
-
-## Quick Start
+First run walks you through a short setup wizard (API provider, key,
+default model). Skip it entirely and the tool still works via a
+deterministic template — you just lose codebase-aware planning, not
+verification.
 
 ```bash
-# Set your API key (one-time)
-export ANTHROPIC_API_KEY="sk-ant-..."   # Claude (recommended)
-# or
-export GROQ_API_KEY="gsk_..."           # Groq / Llama (free tier)
-
-# Run from your project root
-cd /path/to/your/project
-supervisor "Add real vector search with FAISS + SSE streaming responses"
+supervisor init          # (re-)run the setup wizard
 ```
-
-That's it. 7 agent prompts printed and saved to `supervisor_plan_<timestamp>.md`.
 
 ---
 
 ## Usage
 
-```
-supervisor IDEA [PROJECT_DIR] [OPTIONS]
-```
-
-### Arguments
-
-| Argument       | Description                                                      |
-|---------------|------------------------------------------------------------------|
-| `IDEA`         | Your high-level feature idea (quoted string). Prompted if omitted. |
-| `PROJECT_DIR`  | Path to your project root. Defaults to current directory.        |
-
-### Options
-
-| Flag                    | Short | Description                                                    |
-|------------------------|-------|----------------------------------------------------------------|
-| `--project-dir DIR`     | `-p`  | Named form of PROJECT_DIR (overrides positional).              |
-| `--api-key KEY`         | `-k`  | Anthropic API key (overrides `ANTHROPIC_API_KEY` env var).     |
-| `--groq-key KEY`        |       | Groq API key (overrides `GROQ_API_KEY` env var).               |
-| `--model MODEL`         | `-m`  | Anthropic model. Default: `claude-sonnet-4-6`.                 |
-| `--output-dir DIR`      | `-o`  | Where to save the plan `.md` file. Default: current directory. |
-| `--no-save`             |       | Skip saving the plan to disk.                                  |
-| `--iterate`             |       | Enter iteration loop after first plan.                         |
-| `--version`             | `-V`  | Show version and exit.                                         |
-| `--help`                | `-h`  | Show help and exit.                                            |
-
-### Examples
+### Plan + verify in one go
 
 ```bash
-# Basic — scan current dir, use ANTHROPIC_API_KEY from env
-supervisor "Add FAISS vector search with smart chunking"
-
-# Explicit project path (positional shorthand)
-supervisor "Refactor the authentication module" ./my-api
-
-# Explicit project path (named flag)
-supervisor "Add WebSocket support" --project-dir ~/projects/my-api
-
-# Use Groq instead of Claude
-supervisor "Add caching layer" --groq-key gsk_xxx
-
-# Use Claude Opus for complex codebases
-supervisor "Migrate from REST to GraphQL" --model claude-opus-4-6
-
-# Save plan to a specific folder
-supervisor "Add OAuth2 integration" --output-dir ./docs/plans
-
-# Iterate (round 2 after agents finish)
-supervisor "Add OAuth2 integration" --iterate
-
-# Non-interactive (CI/CD usage — no Rich colors needed)
-supervisor "Add rate limiting" --no-save 2>&1 | tee plan.txt
+supervisor "Add FAISS vector search to the /query endpoint"
+supervisor "Add FAISS vector search" ./my-project --model claude-opus-4-6
 ```
 
----
+This scans the codebase, decomposes the idea into a task plan, checks it
+against the dependency graph, and saves both `tasks.md` (human/agent
+readable) and `plan.json` (machine readable) to your project folder.
 
-## API Keys
-
-Supervisor supports two LLM backends:
-
-### Claude (Anthropic) — Recommended
+### Verify a plan from anywhere — no LLM needed
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+supervisor verify --project-dir . --tasks plan.json
+supervisor verify --project-dir . --tasks - < claude_codes_own_plan.json
 ```
 
-Models (pass via `--model`):
-- `claude-sonnet-4-6` — default, fast and smart
-- `claude-opus-4-6` — max intelligence for complex codebases
-- `claude-haiku-4-5-20251001` — fastest, cheapest
+`--tasks` accepts any JSON with a `tasks` list matching the schema below —
+including a plan you wrote by hand, or one another tool produced. Exit
+codes are scriptable: `0` = SAFE, `1` = RISKY, `2` = CONFLICT.
 
-### Groq (Llama) — Free tier available
+### Run as an MCP server
 
 ```bash
-export GROQ_API_KEY="gsk_..."
+supervisor mcp
 ```
 
-Uses `llama-3.3-70b-versatile` automatically. No extra flags needed — Supervisor falls back to Groq if no Anthropic key is set.
+Exposes four tools: `scan_codebase`, `decompose_idea`, `verify_task_plan`,
+`render_tasks_markdown`. Point any MCP client at it (stdio transport) to
+call decomposition and verification directly from your existing agent or
+orchestrator, instead of shelling out to a separate CLI.
 
-### No API key
-
-If neither key is set, Supervisor generates a **deterministic template plan** — still useful for structuring your work, just not codebase-aware.
-
----
-
-## How the 7 Agents are split
-
-By default, Supervisor divides work across these non-overlapping domains:
-
-| Agent | Domain                | Files Touched                          |
-|------|-----------------------|----------------------------------------|
-| 1    | Core Logic            | Primary backend module (e.g. `app.py`) |
-| 2    | API / Route Layer     | Route / endpoint files                 |
-| 3    | Frontend / UI         | Frontend files (`.tsx`, `.jsx`, etc.)  |
-| 4    | Data Models / Schemas | Models, schemas, migrations            |
-| 5    | Tests                 | `tests/` directory                     |
-| 6    | Config & Deps         | `requirements.txt`, `.env.example`     |
-| 7    | Docs & Cleanup        | `README.md`, docstrings, type hints    |
-
-When you have an Anthropic or Groq key, the split is **codebase-aware** — Supervisor reads your actual files and tailors each agent's scope to your specific architecture.
-
----
-
-## Iteration Mode
-
-After all 7 agents finish:
+### Iterate
 
 ```bash
-supervisor "My original idea" --iterate
+supervisor "Add FAISS vector search" --iterate
 ```
 
-Supervisor will:
-1. Ask if you want to run iteration 2
-2. Prompt you to paste all 7 agent outputs (diffs, summaries)
-3. Type `END` on a new line when done
-4. Generate 7 new prompts for integration, conflict resolution, and remaining tasks
+After the first round, paste back what happened (diffs, summaries — from
+whatever ran the tasks), and the next round's plan is generated with that
+context plus the previous round's verification report, so repeated
+conflicts get corrected instead of repeated.
 
 ---
 
-## Output Format
+## The task plan schema
 
-Every run saves a file like `supervisor_plan_20250115_142301.md` to your current directory:
-
-```markdown
-# Supervisor Plan — 2025-01-15 14:23:01
-
-Generated by swarm-supervisor
-
----
-
-=== AUTO-RESEARCHER PLAN ===
-1. Implement FAISS index building in app.py ...
-...
-
-=== 7 AGENT PROMPTS (copy-paste ready) ===
-
-**AGENT 1 - Core Vector Search Logic**
-You are working ONLY on `app.py` ...
-
-...
-
-=== INSTRUCTIONS FOR ME ===
-- Open 7 Qwen Code windows simultaneously
-...
+```json
+{
+  "idea": "Add rate limiting to the /upload endpoint",
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Rate-limit middleware",
+      "description": "Implement a token-bucket limiter as FastAPI middleware.",
+      "target_files": ["app/middleware/rate_limit.py"],
+      "avoid_files": ["app/routes/upload.py"],
+      "depends_on": [],
+      "acceptance_criteria": ["429 returned after limit exceeded", "unit tests pass"]
+    }
+  ],
+  "integration_notes": "Wire the middleware into app/main.py after T1 lands."
+}
 ```
 
+Plain JSON, no tool-specific fields. `supervisor verify` and the MCP
+`verify_task_plan` tool only require the `tasks` list with `id` and
+`target_files` on each entry — everything else is optional.
+
 ---
 
-## Requirements
+## How verification works
 
-- Python 3.9+
-- `rich` ≥ 13.0 (terminal UI)
-- `anthropic` ≥ 0.25 (optional — for Claude backend)
+`depgraph.py` resolves two kinds of edges from your actual source:
 
-Install Groq support (no extra package needed — uses stdlib `urllib`).
+- **Import edges** — Python dotted-module resolution (absolute + relative),
+  JS/TS relative-path resolution with extension guessing.
+- **Call edges** — Python only, name-based: if file A calls a function
+  named `X` and file B defines a function/class named `X`, that's a
+  candidate edge. This is a heuristic (no real scope resolution), so it can
+  over-flag common names — it errs toward more caution, not less.
+
+`verifier.py` then scores a task plan:
+
+| Check | What it means |
+|---|---|
+| **Direct conflicts** | Same file claimed by 2+ tasks — always `CONFLICT`. |
+| **Coupling risks** | An import/call edge crosses two tasks' file sets — real entanglement, not assumed. |
+| **Hotspot hits** | A high-in-degree or pattern-matched shared-surface file (`config.py`, `routes.py`, `__init__.py`, ...) claimed by more than one task. |
+
+Score starts at 100 and is docked per finding; verdict is `SAFE` / `RISKY`
+/ `CONFLICT`. None of this requires an LLM call — it's static analysis
+over what your code actually imports and calls.
+
+**Known limitation:** this is heuristic, not a language server. It won't
+catch every semantic conflict (e.g. two tasks relying on incompatible
+assumptions about a shared file neither one edits), and the call-graph
+heuristic can produce false positives on generically-named functions. It's
+meaningfully more grounded than trusting an LLM's promise, not a
+replacement for actually running the tasks and testing the result.
 
 ---
 
 ## Development
 
 ```bash
-git clone https://github.com/plexhedge/swarm-supervisor
-cd swarm-supervisor
-pip install -e ".[dev]"
-
-# Run tests
+pip install -e ".[dev,mcp]"
 pytest
-
-# Build for PyPI
-python -m build
-twine upload dist/*
 ```
+
+The test suite (33 tests) covers the dependency graph resolver, task
+parsing/rendering, conflict scoring, the codebase scanner, config file
+permissions, and the CLI argument dispatch — all without needing API keys,
+since none of it depends on a live LLM call.
 
 ---
 
-## Project Structure
+## License
 
-```
-swarm_supervisor/
-├── __init__.py     — version + metadata
+MIT — see [LICENSE](LICENSE).
+adata
 ├── cli.py          — argparse entry point + main()
 ├── researcher.py   — codebase scanner (AST + file tree)
 ├── planner.py      — LLM planner (Anthropic + Groq + fallback)

@@ -5,14 +5,15 @@ build-backend = "setuptools.build_meta"
 # ─────────────────────────────────────────────────────────────────────────────
 [project]
 name        = "swarm-supervisor"
-version     = "1.0.0"
-description = "Karpathy-style AutoResearcher — turn one idea into 7 parallel Qwen Code agent prompts"
+version     = "2.0.0"
+description = "Agent-agnostic task decomposition + dependency-graph conflict verification for AI coding agents. CLI, tasks.md, and MCP server — no fixed agent count, no tool lock-in."
 readme      = "README.md"
 license     = "MIT"
 authors     = [{ name = "Plex Hedge", email = "hello@plexhedge.com" }]
 keywords    = [
-    "ai", "agents", "automation", "qwen", "supervisor",
-    "code-generation", "llm", "anthropic", "swarm",
+    "ai", "agents", "agentic", "automation", "supervisor",
+    "code-generation", "llm", "anthropic", "mcp", "model-context-protocol",
+    "task-decomposition", "dependency-graph", "spec-kit", "agents-md",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -37,6 +38,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mcp = [
+    "mcp>=1.0.0",
+]
 dev = [
     "build",
     "twine",

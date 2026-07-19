@@ -1,7 +1,10 @@
 """
 config.py — Credential storage and first-run onboarding wizard.
 
-Config file lives at: ~/.supervisor/config.json
+Config file lives at: ~/.supervisor/config.json, written with 0600
+permissions (owner read/write only) — a plaintext file is still not a
+keychain, but this at least stops other local users on a shared machine
+from reading your API keys off disk with a casual `cat`.
 
 Structure
 ---------
@@ -16,7 +19,7 @@ Structure
     "ask_clarification":   bool,
     "show_preflight":      bool,
     "created_at":          "ISO date",
-    "version":             "1.0.0"
+    "version":             "2.0.0"
 }
 """
 
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +39,8 @@ from . import display as ui
 # ── Config location ───────────────────────────────────────────────────────────
 CONFIG_DIR  = Path.home() / ".supervisor"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+_OWNER_RW = stat.S_IRUSR | stat.S_IWUSR  # 0600
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 _DEFAULTS: dict = {
@@ -52,15 +58,19 @@ _DEFAULTS: dict = {
 }
 
 # ── Model options ─────────────────────────────────────────────────────────────
+# NOTE: provider model catalogs move fast — these are a reasonable default as
+# of writing, not a guarantee. `supervisor init` lets you type a custom model
+# string at any time if these have been renamed/retired upstream.
 ANTHROPIC_MODELS = [
     ("claude-sonnet-4-6",         "Sonnet 4.6  — Fast & smart  [recommended]"),
     ("claude-opus-4-6",           "Opus 4.6    — Max intelligence, complex codebases"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5   — Fastest & cheapest"),
+    ("custom",                    "Custom      — type your own model string"),
 ]
 GROQ_MODELS = [
     ("llama-3.3-70b-versatile", "Llama 3.3 70B  — Best Groq model  [recommended]"),
     ("llama-3.1-8b-instant",    "Llama 3.1 8B   — Ultra-fast, lower quality"),
-    ("mixtral-8x7b-32768",      "Mixtral 8x7B   — Long context"),
+    ("custom",                  "Custom          — type your own model string"),
 ]
 
 
@@ -75,7 +85,6 @@ def load_config() -> dict:
         return dict(_DEFAULTS)
     try:
         raw = json.loads(CONFIG_FILE.read_text("utf-8"))
-        # Merge with defaults so new keys added in later versions are present
         merged = dict(_DEFAULTS)
         merged.update(raw)
         return merged
@@ -84,9 +93,11 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """Persist config to disk."""
+    """Persist config to disk, restricted to owner read/write."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    _harden(CONFIG_FILE)
+    _harden(CONFIG_DIR, dir_mode=True)
 
 
 def is_setup() -> bool:
@@ -98,6 +109,15 @@ def reset_config() -> None:
     """Wipe stored config (used by `supervisor init --reset`)."""
     if CONFIG_FILE.exists():
         CONFIG_FILE.unlink()
+
+
+def _harden(path: Path, dir_mode: bool = False) -> None:
+    """Best-effort chmod — silently no-ops on platforms without POSIX perms (Windows)."""
+    try:
+        mode = (stat.S_IRWXU) if dir_mode else _OWNER_RW
+        os.chmod(path, mode)
+    except (OSError, NotImplementedError):
+        pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -177,7 +197,8 @@ def run_onboarding(force: bool = False) -> dict:
     if provider == "anthropic":
         _print_hint(
             "Get your Anthropic API key at: https://console.anthropic.com/keys\n"
-            "  It looks like: sk-ant-api03-..."
+            "  It looks like: sk-ant-api03-...\n"
+            "  Stored locally at ~/.supervisor/config.json, chmod 600 (owner-only)."
         )
         key = _ask_secret("Paste your Anthropic API key (or press Enter to skip): ")
         if key:
@@ -189,7 +210,8 @@ def run_onboarding(force: bool = False) -> dict:
     elif provider == "groq":
         _print_hint(
             "Get your free Groq API key at: https://console.groq.com/keys\n"
-            "  It looks like: gsk_..."
+            "  It looks like: gsk_...\n"
+            "  Stored locally at ~/.supervisor/config.json, chmod 600 (owner-only)."
         )
         key = _ask_secret("Paste your Groq API key (or press Enter to skip): ")
         if key:
@@ -213,6 +235,8 @@ def run_onboarding(force: bool = False) -> dict:
             choices=[(m, label) for m, label in model_choices],
             default=model_choices[0][0],
         )
+        if model == "custom":
+            model = _ask("  Type the exact model string: ").strip() or model_choices[0][0]
         cfg["default_model"] = model
         ui.success(f"Default model set to: {model}")
     else:
@@ -252,7 +276,7 @@ def run_onboarding(force: bool = False) -> dict:
         default=True,
     )
     cfg["auto_save_plans"] = _yes_no(
-        "Auto-save plans as Markdown files in your project folder?",
+        "Auto-save tasks.md + plan.json in your project folder?",
         default=True,
     )
 
@@ -283,10 +307,10 @@ def show_config() -> None:
             v = str(_safe[field])
             _safe[field] = v[:8] + "..." + v[-4:] if len(v) > 12 else "***"
 
-    try:
+    if ui.RICH:
         from rich.table import Table
+        from rich.panel import Panel
         from rich import box as rbox
-        from .display import console
 
         table = Table(box=rbox.ROUNDED, border_style="cyan", show_header=False, padding=(0, 1))
         table.add_column("Key",   style="dim white", min_width=24)
@@ -303,13 +327,12 @@ def show_config() -> None:
                 val = str(v)
             table.add_row(k, val)
 
-        console.print()
-        from rich.panel import Panel
-        console.print(Panel(table, title="[bold cyan]⚙  Current Config[/bold cyan]",
-                            border_style="cyan"))
-        console.print(f"[dim]  Config file: {CONFIG_FILE}[/dim]")
-        console.print()
-    except Exception:
+        ui.console.print()
+        ui.console.print(Panel(table, title="[bold cyan]⚙  Current Config[/bold cyan]",
+                                border_style="cyan"))
+        ui.console.print(f"[dim]  Config file: {CONFIG_FILE}[/dim]")
+        ui.console.print()
+    else:
         print(json.dumps(_safe, indent=2))
         print(f"\nConfig file: {CONFIG_FILE}")
 
@@ -319,22 +342,21 @@ def show_config() -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _wizard_header() -> None:
-    try:
+    if ui.RICH:
         from rich.panel import Panel
         from rich.text import Text
         from rich.align import Align
         from rich import box as rbox
-        from .display import console
 
-        console.print()
-        console.print(
+        ui.console.print()
+        ui.console.print(
             Panel(
                 Align.center(
                     Text(
                         "Welcome to swarm-supervisor!\n\n"
                         "This 5-step wizard will configure your API provider,\n"
                         "credentials, default model, and behaviour preferences.\n\n"
-                        "Your config is saved to: ~/.supervisor/config.json\n"
+                        "Your config is saved to: ~/.supervisor/config.json (chmod 600)\n"
                         "API keys are stored locally — never sent anywhere except\n"
                         "directly to Anthropic / Groq.",
                         style="white",
@@ -347,7 +369,7 @@ def _wizard_header() -> None:
                 padding=(1, 4),
             )
         )
-    except Exception:
+    else:
         print("\n" + "="*60)
         print("  SUPERVISOR — FIRST-RUN SETUP WIZARD")
         print("="*60)
@@ -356,22 +378,24 @@ def _wizard_header() -> None:
 def _wizard_done(cfg: dict) -> None:
     provider = cfg.get("provider", "none")
     model    = cfg.get("default_model", "—")
-    try:
+    if ui.RICH:
         from rich.panel import Panel
         from rich.text import Text
         from rich.align import Align
         from rich import box as rbox
-        from .display import console
 
         body = (
             f"[bold white]Provider:[/bold white] [cyan]{provider}[/cyan]\n"
             f"[bold white]Model:[/bold white]    [cyan]{model}[/cyan]\n\n"
             "[bold green]You're ready to go![/bold green]\n\n"
-            "Run:  [bold white]supervisor \"your idea here\"[/bold white]\n"
-            "Help: [bold white]supervisor --help[/bold white]\n"
-            "Edit: [bold white]supervisor init[/bold white]  (re-run this wizard)"
+            "Run:    [bold white]supervisor \"your idea here\"[/bold white]\n"
+            "Verify: [bold white]supervisor verify --tasks plan.json[/bold white]  "
+            "(check any plan for conflicts — even one from another tool)\n"
+            "MCP:    [bold white]supervisor mcp[/bold white]  (expose as an MCP server)\n"
+            "Help:   [bold white]supervisor --help[/bold white]\n"
+            "Edit:   [bold white]supervisor init[/bold white]  (re-run this wizard)"
         )
-        console.print(
+        ui.console.print(
             Panel(
                 Align.center(Text.from_markup(body, justify="center")),
                 title="[bold green]✓  SETUP COMPLETE[/bold green]",
@@ -380,38 +404,33 @@ def _wizard_done(cfg: dict) -> None:
                 padding=(1, 4),
             )
         )
-    except Exception:
+    else:
         print(f"\n✓ Setup complete. Provider: {provider}, Model: {model}")
         print('Run: supervisor "your idea here"')
 
 
-def _choose(prompt: str, choices: list[tuple[str, str]], default: Optional[str] = None) -> str:
-    """
-    Present a numbered list and return the chosen value.
-    `choices` is a list of (value, display_label) tuples.
-    """
-    try:
+def _choose(prompt: str, choices: list, default: Optional[str] = None) -> str:
+    """Present a numbered list and return the chosen value."""
+    if ui.RICH:
         from rich.table import Table
         from rich import box as rbox
-        from .display import console
 
         table = Table(box=rbox.SIMPLE, show_header=False, padding=(0, 1))
         table.add_column("#",     style="bold cyan",  width=4, justify="right")
-        table.add_column("Option",style="bold white")
+        table.add_column("Option", style="bold white")
 
         for i, (_, label) in enumerate(choices, 1):
             table.add_row(str(i), label)
 
-        console.print(f"  [bold yellow]{prompt}[/bold yellow]")
-        console.print(table)
+        ui.console.print(f"  [bold yellow]{prompt}[/bold yellow]")
+        ui.console.print(table)
 
         while True:
             raw = _ask(f"  Enter number [1–{len(choices)}]: ").strip()
             if raw.isdigit() and 1 <= int(raw) <= len(choices):
-                val = choices[int(raw) - 1][0]
-                return val
+                return choices[int(raw) - 1][0]
             print(f"  Please enter a number between 1 and {len(choices)}.")
-    except Exception:
+    else:
         print(f"\n{prompt}")
         for i, (_, label) in enumerate(choices, 1):
             print(f"  {i}. {label}")
@@ -430,12 +449,6 @@ def _yes_no(prompt: str, default: bool = True) -> bool:
 
 
 def _ask(prompt: str) -> str:
-    try:
-        from rich.prompt import Prompt
-        # Use plain input so we can control the prompt string exactly
-        pass
-    except Exception:
-        pass
     return input(prompt)
 
 
@@ -449,8 +462,7 @@ def _ask_secret(prompt: str) -> str:
 
 
 def _print_hint(text: str) -> None:
-    try:
-        from .display import console
-        console.print(f"  [dim]{text}[/dim]")
-    except Exception:
+    if ui.RICH:
+        ui.console.print(f"  [dim]{text}[/dim]")
+    else:
         print(f"  {text}")

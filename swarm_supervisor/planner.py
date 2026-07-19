@@ -1,10 +1,18 @@
 """
 planner.py — LLM planner for swarm-supervisor.
 
-Builds the prompt context from codebase research, then calls
-Claude (via Anthropic SDK) or Groq (raw HTTP) to generate the
-7-agent execution plan.  Falls back to a deterministic template
-when no API key is present.
+Builds prompt context from codebase research (including dependency-graph
+hotspots, so the model sees likely trouble spots before it plans around
+them) and calls Claude (Anthropic SDK) or Groq (stdlib HTTP) to produce a
+TaskPlan. Falls back to a deterministic template when no API key is set.
+
+Two things changed from v1, both deliberate:
+  · No fixed task count. The prompt asks for however many independent
+    tasks the idea actually needs (typically 2-10) instead of forcing 7.
+  · No named target tool. The model is asked for structured JSON — a
+    TaskPlan — not markdown formatted for pasting into one specific CLI.
+    Structured output is also just more reliable to parse than hoping an
+    LLM reproduces a "**AGENT N - Role**" heading exactly every time.
 """
 
 from __future__ import annotations
@@ -17,10 +25,17 @@ import urllib.request
 from typing import Optional
 
 from . import display as ui
+from .depgraph import build_from_research
+from .tasks import TaskPlan, TaskPlanParseError, parse_llm_json
 
 # ── Model defaults ────────────────────────────────────────────────────────────
+# NOTE: check these periodically — provider model catalogs are retired /
+# renamed faster than this file gets updated. `supervisor init` lets you
+# override with any model string.
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_GROQ_MODEL      = "llama-3.3-70b-versatile"
+
+_MAX_PARSE_RETRIES = 1  # one retry with a sterner reminder before giving up
 
 # ── Lazy Anthropic import ─────────────────────────────────────────────────────
 try:
@@ -34,79 +49,192 @@ except ImportError:
 # PUBLIC API
 # ═════════════════════════════════════════════════════════════════════════════
 
-def create_execution_plan(
-    idea:       str,
-    research:   dict,
-    api_key:    Optional[str] = None,
-    model:      Optional[str] = None,
-    groq_key:   Optional[str] = None,
-) -> str:
+def create_task_plan(
+    idea:      str,
+    research:  dict,
+    api_key:   Optional[str] = None,
+    model:     Optional[str] = None,
+    groq_key:  Optional[str] = None,
+) -> TaskPlan:
     """
-    Analyse the codebase research snapshot and generate the 7-agent plan.
+    Analyse the codebase research snapshot and return a TaskPlan.
 
-    Priority:
-        1. Anthropic Claude  (ANTHROPIC_API_KEY env or --api-key flag)
-        2. Groq              (GROQ_API_KEY env or --groq-key flag)
-        3. Deterministic template fallback
-
-    Parameters
-    ----------
-    idea      : the developer's high-level feature idea
-    research  : output of researcher.research_codebase()
-    api_key   : Anthropic API key (overrides env)
-    model     : Anthropic model string (default: claude-sonnet-4-6)
-    groq_key  : Groq API key (overrides env)
-
-    Returns
-    -------
-    str — full plan text following the === AUTO-RESEARCHER PLAN === format
+    Priority: Anthropic Claude → Groq → deterministic template fallback.
+    Raises TaskPlanParseError only if an LLM responded but never produced
+    parseable JSON even after one retry — callers should treat that as
+    "replan or fall back," not silently proceed.
     """
-    with ui.make_spinner("Generating 7-agent execution plan…") as sp:
+    with ui.make_spinner("Decomposing idea into a task plan…") as sp:
         sp.add_task("")
 
-        # ── 1. Try Anthropic ──────────────────────────────────────────────
         ant_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
         if ant_key and HAS_ANTHROPIC:
-            result = _call_anthropic(idea, research, ant_key, model or DEFAULT_ANTHROPIC_MODEL)
-            ui.success(f"Plan generated via Claude ({model or DEFAULT_ANTHROPIC_MODEL})")
-            return result
+            raw = _call_anthropic_with_retries(idea, research, ant_key, model or DEFAULT_ANTHROPIC_MODEL)
+            if raw is not None:
+                plan = parse_llm_json(raw, idea_fallback=idea)
+                ui.success(f"Plan generated via Claude ({model or DEFAULT_ANTHROPIC_MODEL}) — {len(plan.tasks)} task(s)")
+                return plan
 
         if ant_key and not HAS_ANTHROPIC:
             ui.warn("ANTHROPIC_API_KEY set but `anthropic` package not installed. "
                     "Run: pip install anthropic")
 
-        # ── 2. Try Groq ───────────────────────────────────────────────────
         g_key = groq_key or os.getenv("GROQ_API_KEY", "")
         if g_key:
-            result = _call_groq(idea, research, g_key)
-            if result:
-                ui.success(f"Plan generated via Groq ({DEFAULT_GROQ_MODEL})")
-                return result
+            raw = _call_groq_with_retries(idea, research, g_key)
+            if raw is not None:
+                plan = parse_llm_json(raw, idea_fallback=idea)
+                ui.success(f"Plan generated via Groq ({DEFAULT_GROQ_MODEL}) — {len(plan.tasks)} task(s)")
+                return plan
 
-        # ── 3. Fallback template ──────────────────────────────────────────
         ui.warn(
-            "No API key detected. Using deterministic template.\n"
+            "No API key detected (or the model never returned parseable JSON). "
+            "Using deterministic template.\n"
             "    Set ANTHROPIC_API_KEY or GROQ_API_KEY for AI-powered planning."
         )
         return _template_plan(idea, research)
+
+
+def plan_next_iteration(
+    idea:           str,
+    previous_plan:  TaskPlan,
+    results_text:   str,
+    research:       dict,
+    verification:   Optional[dict] = None,
+    api_key:        Optional[str] = None,
+    model:          Optional[str] = None,
+    groq_key:       Optional[str] = None,
+) -> TaskPlan:
+    """
+    Given the results from the previous round's tasks (and, if available,
+    that round's dependency-graph verification report), plan the next round.
+    If the previous plan came back RISKY/CONFLICT, the specific conflicts
+    are fed back in so the model corrects them instead of repeating them.
+    """
+    system = textwrap.dedent("""
+        You are a senior systems architect running the next iteration of an
+        automated task-decomposition tool. Analyse what was built, identify
+        integration points and remaining gaps, then produce a NEW TaskPlan
+        as JSON, following the exact schema you were given previously.
+        Output ONLY the JSON object — no commentary, no markdown fences.
+    """).strip()
+
+    verification_block = ""
+    if verification and verification.get("verdict") != "SAFE":
+        verification_block = textwrap.dedent(f"""
+            ## Previous Round's Dependency-Graph Verification (fix these)
+            Verdict: {verification.get('verdict')}  (score {verification.get('score')}/100)
+            Direct conflicts: {json.dumps(verification.get('direct_conflicts', []))}
+            Coupling risks: {len(verification.get('coupling_risks', []))} cross-task edge(s)
+            Hotspot hits: {json.dumps(verification.get('hotspot_hits', []))}
+
+            The new plan MUST resolve every direct conflict above (no two tasks may
+            claim the same file) and should reduce coupling/hotspot overlap where
+            possible.
+        """).strip()
+
+    user = textwrap.dedent(f"""
+        ## Original Idea
+        {idea}
+
+        ## Previous Round's Task Plan
+        {previous_plan.to_json()}
+
+        ## Previous Round's Results (diffs / summaries from that round's tasks)
+        {results_text}
+
+        {verification_block}
+
+        ---
+
+        Identify:
+        1. What was successfully completed.
+        2. What needs integration or conflict resolution.
+        3. What new tasks remain.
+
+        Then produce the next TaskPlan as JSON, in the same schema as before.
+        Use however many tasks the remaining work actually needs.
+    """).strip()
+
+    with ui.make_spinner("Planning next iteration…") as sp:
+        sp.add_task("")
+
+        ant_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
+        if ant_key and HAS_ANTHROPIC:
+            raw = _anthropic_raw_call(system, user, ant_key, model or DEFAULT_ANTHROPIC_MODEL)
+            if raw:
+                try:
+                    plan = parse_llm_json(raw, idea_fallback=idea)
+                    ui.success(f"Next iteration plan generated via Claude — {len(plan.tasks)} task(s)")
+                    return plan
+                except TaskPlanParseError as exc:
+                    ui.error(f"Could not parse iteration plan: {exc}")
+
+        g_key = groq_key or os.getenv("GROQ_API_KEY", "")
+        if g_key:
+            raw = _groq_raw_call(system, user, g_key)
+            if raw:
+                try:
+                    plan = parse_llm_json(raw, idea_fallback=idea)
+                    ui.success(f"Next iteration plan generated via Groq — {len(plan.tasks)} task(s)")
+                    return plan
+                except TaskPlanParseError as exc:
+                    ui.error(f"Could not parse iteration plan: {exc}")
+
+    ui.warn("No usable API response — returning the previous plan unchanged.")
+    return previous_plan
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PROMPT BUILDER
 # ═════════════════════════════════════════════════════════════════════════════
 
-def build_planner_prompt(idea: str, research: dict) -> tuple[str, str]:
-    """
-    Construct (system_prompt, user_prompt) for the planning LLM call.
+_JSON_SCHEMA_INSTRUCTIONS = textwrap.dedent("""
+    Respond with ONLY a single JSON object — no preamble, no commentary, no
+    markdown code fences — matching this exact schema:
 
-    Returns
-    -------
-    (system: str, user: str)
-    """
-    file_tree_str    = "\n".join(research["file_tree"][:100])
+    {
+      "idea": "<restated idea, one line>",
+      "tasks": [
+        {
+          "id": "T1",
+          "title": "<short task name>",
+          "description": "<what to build, specific enough to hand to any coding agent>",
+          "target_files": ["<exact relative file paths this task will create or edit>"],
+          "avoid_files": ["<files this task must NOT touch, to prevent conflicts>"],
+          "depends_on": ["<ids of tasks that must land first, or [] if independent>"],
+          "acceptance_criteria": ["<binary, checkable criteria>"]
+        }
+      ],
+      "integration_notes": "<how to merge/order the tasks once all are done>"
+    }
+
+    Rules:
+    - Choose however many tasks the idea's actual scope needs — typically
+      2 to 10. Do not force a fixed count. A one-line change might need 1-2
+      tasks; a multi-layer feature might need 6-8. Never pad with filler
+      tasks just to hit a number.
+    - target_files must use exact relative paths from the file tree given
+      below. Two tasks must never list the same file in target_files.
+    - Prefer giving each task files it can complete independently of tasks
+      in the same wave (i.e. tasks with no depends_on between them).
+    - Be specific: reference real filenames and function/symbol names from
+      the codebase context, not generic placeholders.
+""").strip()
+
+
+def build_planner_prompt(idea: str, research: dict) -> tuple[str, str]:
+    """Construct (system_prompt, user_prompt) for the planning LLM call."""
+    file_tree_str    = "\n".join(research["file_tree"][:150])
     function_map_str = json.dumps(research["function_map"], indent=2)
 
-    # Summarise each file (first 40 lines to keep prompt manageable)
+    graph = build_from_research(research)
+    hotspots = graph.hotspots()[:10]
+    hotspot_str = (
+        "\n".join(f"- {h['file']} ({h['reason']})" for h in hotspots)
+        or "None detected."
+    )
+
     content_blocks = []
     for fname, content in research["file_contents"].items():
         lines   = content.splitlines()
@@ -116,15 +244,15 @@ def build_planner_prompt(idea: str, research: dict) -> tuple[str, str]:
     contents_str = "\n\n".join(content_blocks)
 
     system = textwrap.dedent("""
-        You are a senior systems architect and elite prompt engineer.
-        Your job is to:
-          1. Analyse a developer's codebase snapshot.
-          2. Understand the high-level feature idea.
-          3. Produce a precise, opinionated execution plan.
-          4. Generate EXACTLY 7 parallel, non-overlapping Qwen Code agent prompts.
+        You are a senior systems architect. Your job is to turn a developer's
+        feature idea plus a codebase snapshot into a precise, independently
+        executable task plan — the kind that could be handed to several
+        coding agents (or several human contributors) working in parallel
+        without stepping on each other's files.
 
-        Output ONLY the structured plan — no preamble, no commentary, no apologies.
-        Follow the output format EXACTLY as specified in the user message.
+        You are NOT told which specific coding agent or tool will execute
+        these tasks. Write task descriptions that are agent-agnostic — clear
+        enough for any capable coding agent or developer to execute exactly.
     """).strip()
 
     user = textwrap.dedent(f"""
@@ -141,6 +269,10 @@ def build_planner_prompt(idea: str, research: dict) -> tuple[str, str]:
         {function_map_str}
         ```
 
+        ## Dependency-Graph Hotspots (files already heavily depended-upon —
+        avoid assigning these to more than one task where possible)
+        {hotspot_str}
+
         ## Dependency Manifests
         ```
         {research['deps']}
@@ -151,54 +283,7 @@ def build_planner_prompt(idea: str, research: dict) -> tuple[str, str]:
 
         ---
 
-        ## Your Task
-
-        Step 1 — Analyse the codebase and the idea above deeply.
-        Step 2 — Create a numbered execution plan with EXACTLY 7 non-overlapping macro tasks.
-        Step 3 — For each task, write one Qwen Code agent prompt that:
-            • Is high-level but extremely precise.
-            • Explicitly states what the agent MUST NOT touch (to prevent merge conflicts).
-            • References exact filenames and function names from the codebase above.
-            • Includes clear, binary success criteria.
-            • Instructs the agent to output clean diffs and "Ask before edits" when uncertain.
-        Step 4 — End with a short integration checklist.
-
-        ## REQUIRED OUTPUT FORMAT (reproduce EXACTLY — no deviation):
-
-        === AUTO-RESEARCHER PLAN ===
-        1. [Task 1 description]
-        2. [Task 2 description]
-        3. [Task 3 description]
-        4. [Task 4 description]
-        5. [Task 5 description]
-        6. [Task 6 description]
-        7. [Task 7 description]
-
-        === 7 AGENT PROMPTS (copy-paste ready) ===
-
-        **AGENT 1 - [Clear Role Name]**
-        [Full prompt text — minimum 5 sentences. Include: files to touch, files NOT to touch, functions to implement, success criteria, diff + ask-before-edits instruction.]
-
-        **AGENT 2 - [Clear Role Name]**
-        [Full prompt text]
-
-        **AGENT 3 - [Clear Role Name]**
-        [Full prompt text]
-
-        **AGENT 4 - [Clear Role Name]**
-        [Full prompt text]
-
-        **AGENT 5 - [Clear Role Name]**
-        [Full prompt text]
-
-        **AGENT 6 - [Clear Role Name]**
-        [Full prompt text]
-
-        **AGENT 7 - [Clear Role Name]**
-        [Full prompt text]
-
-        === INSTRUCTIONS FOR ME ===
-        - [Step-by-step integration checklist for after all 7 agents finish]
+        {_JSON_SCHEMA_INSTRUCTIONS}
     """).strip()
 
     return system, user
@@ -208,22 +293,41 @@ def build_planner_prompt(idea: str, research: dict) -> tuple[str, str]:
 # LLM BACKENDS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _call_anthropic(idea: str, research: dict, api_key: str, model: str) -> str:
+def _call_anthropic_with_retries(idea: str, research: dict, api_key: str, model: str) -> Optional[str]:
     system, user = build_planner_prompt(idea, research)
-    client  = _anthropic_sdk.Anthropic(api_key=api_key)
-    message = client.messages.create(
-        model=model,
-        max_tokens=4096,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return message.content[0].text
+    return _anthropic_raw_call_with_retry(system, user, api_key, model)
 
 
-def _call_groq(idea: str, research: dict, groq_key: str) -> Optional[str]:
-    """Call Groq's OpenAI-compatible endpoint using stdlib only (no SDK)."""
+def _call_groq_with_retries(idea: str, research: dict, groq_key: str) -> Optional[str]:
     system, user = build_planner_prompt(idea, research)
+    return _groq_raw_call_with_retry(system, user, groq_key)
 
+
+def _anthropic_raw_call(system: str, user: str, api_key: str, model: str) -> Optional[str]:
+    try:
+        client  = _anthropic_sdk.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model=model, max_tokens=4096, system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        return message.content[0].text
+    except Exception as exc:
+        ui.error(f"Anthropic request failed: {exc}")
+        return None
+
+
+def _anthropic_raw_call_with_retry(system: str, user: str, api_key: str, model: str) -> Optional[str]:
+    """Call Anthropic, and if the response isn't parseable JSON, retry once with a sterner reminder."""
+    raw = _anthropic_raw_call(system, user, api_key, model)
+    if raw is None:
+        return None
+    if _looks_parseable(raw):
+        return raw
+    stern_user = user + "\n\nREMINDER: respond with ONLY the JSON object. No prose, no fences."
+    return _anthropic_raw_call(system, stern_user, api_key, model) or raw
+
+
+def _groq_raw_call(system: str, user: str, groq_key: str) -> Optional[str]:
     payload = json.dumps({
         "model": DEFAULT_GROQ_MODEL,
         "messages": [
@@ -231,16 +335,13 @@ def _call_groq(idea: str, research: dict, groq_key: str) -> Optional[str]:
             {"role": "user",   "content": user},
         ],
         "max_tokens": 4096,
-        "temperature": 0.3,
+        "temperature": 0.2,
     }).encode("utf-8")
 
     req = urllib.request.Request(
         "https://api.groq.com/openai/v1/chat/completions",
         data=payload,
-        headers={
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {groq_key}",
-        },
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {groq_key}"},
         method="POST",
     )
     try:
@@ -256,180 +357,94 @@ def _call_groq(idea: str, research: dict, groq_key: str) -> Optional[str]:
         return None
 
 
+def _groq_raw_call_with_retry(system: str, user: str, groq_key: str) -> Optional[str]:
+    raw = _groq_raw_call(system, user, groq_key)
+    if raw is None:
+        return None
+    if _looks_parseable(raw):
+        return raw
+    stern_user = user + "\n\nREMINDER: respond with ONLY the JSON object. No prose, no fences."
+    return _groq_raw_call(system, stern_user, groq_key) or raw
+
+
+def _looks_parseable(raw: str) -> bool:
+    """Cheap pre-check so we don't burn a retry on obviously-fine output."""
+    try:
+        parse_llm_json(raw)
+        return True
+    except TaskPlanParseError:
+        return False
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # DETERMINISTIC TEMPLATE FALLBACK
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _template_plan(idea: str, research: dict) -> str:
-    """Generate a structured-but-generic plan with no LLM required."""
-    files   = list(research["file_contents"].keys())
-    primary = files[0] if files else "app.py"
-    second  = files[1] if len(files) > 1 else "utils.py"
-    deps    = research.get("deps", "")
-    has_ts  = any(f.endswith((".ts", ".tsx", ".jsx", ".js")) for f in files)
+def _template_plan(idea: str, research: dict) -> TaskPlan:
+    """
+    Generate a structured-but-generic TaskPlan with no LLM required.
+    Task count adapts to what's actually present in the codebase — a repo
+    with no test directory doesn't get a fabricated "write tests" task
+    pointed at files that don't exist.
+    """
+    files  = list(research["file_contents"].keys())
+    tree   = research.get("file_tree", [])
+    has_ts = any(f.endswith((".ts", ".tsx", ".jsx", ".js")) for f in tree)
+    has_tests = any("test" in f.lower() for f in tree)
     fe_note = "frontend (*.tsx / *.jsx)" if has_ts else "frontend/templates"
 
-    return textwrap.dedent(f"""
-        === AUTO-RESEARCHER PLAN ===
-        1. Implement core data-layer logic for "{idea}" in {primary}
-        2. Expose new functionality via API routes / endpoint layer
-        3. Integrate new endpoints into {fe_note}
-        4. Add / update data models, schemas, and DB migrations
-        5. Write unit + integration tests covering all new code paths
-        6. Update configuration, env vars, and dependency manifest
-        7. Write docs, type-hints, inline comments; clean dead code
+    primary = files[0] if files else "app.py"
+    tasks = [
+        {
+            "id": "T1", "title": "Core logic",
+            "description": f'Implement the core backend logic required for: "{idea}".',
+            "target_files": [primary],
+            "avoid_files": [],
+            "depends_on": [],
+            "acceptance_criteria": ["New functions have type hints and docstrings",
+                                     "Logic is unit-testable in isolation"],
+        },
+        {
+            "id": "T2", "title": "API / route layer",
+            "description": "Expose the new functionality via API routes or an endpoint layer.",
+            "target_files": [], "avoid_files": [primary],
+            "depends_on": ["T1"],
+            "acceptance_criteria": ["Endpoints return correct status codes",
+                                     "Errors are handled gracefully"],
+        },
+    ]
+    if has_ts:
+        tasks.append({
+            "id": "T3", "title": "Frontend integration",
+            "description": f"Wire the {fe_note} to consume the new API endpoints.",
+            "target_files": [], "avoid_files": [primary],
+            "depends_on": ["T2"],
+            "acceptance_criteria": ["UI renders the new feature, including loading/error states"],
+        })
+    if has_tests:
+        tasks.append({
+            "id": f"T{len(tasks)+1}", "title": "Tests",
+            "description": f'Write unit + integration tests covering the new code paths for: "{idea}".',
+            "target_files": [], "avoid_files": [],
+            "depends_on": ["T1"],
+            "acceptance_criteria": ["Test suite passes", "New code paths are covered"],
+        })
+    tasks.append({
+        "id": f"T{len(tasks)+1}", "title": "Docs & cleanup",
+        "description": "Document the new functionality and remove any dead code touched along the way.",
+        "target_files": [], "avoid_files": [],
+        "depends_on": ["T1"],
+        "acceptance_criteria": ["README/docstrings updated", "No dead code left behind"],
+    })
 
-        === 7 AGENT PROMPTS (copy-paste ready) ===
-
-        **AGENT 1 - Core Logic**
-        You are working ONLY on `{primary}`.
-        Implement the core backend logic required for: "{idea}".
-        DO NOT touch: API route files, {fe_note} files, test files, config files.
-        Your deliverable: new functions/classes that can be imported by the route layer.
-        Success criteria: all new functions have type hints, docstrings, and are unit-testable in isolation.
-        Output a clean unified diff. Ask before making any irreversible structural change.
-
-        **AGENT 2 - API / Route Layer**
-        You are working ONLY on the API or route files (e.g. routes.py, api.py, views.py, or equivalent).
-        Add/update HTTP endpoints to expose the functionality built by Agent 1.
-        DO NOT touch: {primary}, {fe_note} files, data-model files, test files.
-        Success criteria: all endpoints return correct HTTP status codes, JSON schemas, and handle errors gracefully.
-        Output a clean unified diff. Ask before edits.
-
-        **AGENT 3 - Frontend / UI**
-        You are working ONLY on {fe_note} files.
-        Wire the UI to consume the new API endpoints from Agent 2.
-        DO NOT touch: backend Python files, data models, test files, config.
-        Success criteria: UI renders new feature correctly, including loading and error states.
-        Output a clean unified diff. Ask before edits.
-
-        **AGENT 4 - Data Models / Schemas**
-        You are working ONLY on model, schema, or database layer files (e.g. models.py, schemas.py).
-        Add or update data structures required by: "{idea}".
-        DO NOT touch: route files, {fe_note} files, test files, {primary}.
-        Success criteria: models validated (Pydantic / SQLAlchemy / equivalent), migrations run cleanly.
-        Output a clean unified diff. Ask before edits.
-
-        **AGENT 5 - Tests**
-        You are working ONLY on the test suite (tests/ directory or test_*.py files).
-        Write unit + integration tests covering all new functions added for: "{idea}".
-        DO NOT modify any non-test source files.
-        Success criteria: `pytest` passes with >80% coverage on new code paths.
-        Output a clean unified diff. Ask before edits.
-
-        **AGENT 6 - Config & Dependencies**
-        You are working ONLY on requirements.txt, .env.example, config files, and Dockerfile (if present).
-        Add new dependencies, environment variables, and configuration blocks needed for: "{idea}".
-        DO NOT touch application logic or test files.
-        Success criteria: project runs from a fresh clone with your updated setup instructions alone.
-        Output a clean unified diff. Ask before edits.
-
-        **AGENT 7 - Docs, Types & Cleanup**
-        You are working ONLY on README.md, docstrings, inline comments, and type annotations.
-        Document all new functionality. Remove dead code. Add missing type hints.
-        DO NOT change any runtime logic.
-        Success criteria: a new developer can fully understand the feature from docs and type hints alone.
-        Output a clean unified diff. Ask before edits.
-
-        === INSTRUCTIONS FOR ME ===
-        - Open 7 Qwen Code windows simultaneously
-        - Paste one agent prompt into each window — they work on non-overlapping files
-        - Run all 7 in parallel
-        - When all 7 finish: collect their diffs, apply them in order (4 → 1 → 2 → 3 → 5 → 6 → 7)
-        - Run test suite to confirm green
-        - Paste all results back and run `supervisor --iterate` for the next integration round
-    """).strip()
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# ITERATION PLANNER
-# ═════════════════════════════════════════════════════════════════════════════
-
-def plan_next_iteration(
-    idea:          str,
-    original_plan: str,
-    agent_results: str,
-    research:      dict,
-    api_key:       Optional[str] = None,
-    model:         Optional[str] = None,
-    groq_key:      Optional[str] = None,
-) -> str:
-    """
-    Given the results from round 1 agents, plan round 2.
-
-    Builds a new prompt from the combined context (original idea +
-    previous plan + agent outputs) and fires the same LLM chain.
-    """
-    system = (
-        "You are a senior systems architect running iteration 2 of an "
-        "automated 7-agent code swarm. Analyse what was built, identify "
-        "integration points and remaining gaps, then generate a NEW set "
-        "of exactly 7 non-overlapping agent prompts following the same "
-        "=== AUTO-RESEARCHER PLAN === format."
-    )
-
-    user = textwrap.dedent(f"""
-        ## Original Idea
-        {idea}
-
-        ## Round 1 Execution Plan
-        {original_plan}
-
-        ## Round 1 Agent Results (diffs / summaries from all 7 agents)
-        {agent_results}
-
-        ---
-
-        Identify:
-        1. What was successfully completed.
-        2. What needs integration or conflict resolution.
-        3. What new tasks remain.
-
-        Then produce the next 7-agent plan in EXACTLY the same format as before.
-    """).strip()
-
-    with ui.make_spinner("Planning iteration 2…") as sp:
-        sp.add_task("")
-
-        ant_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
-        if ant_key and HAS_ANTHROPIC:
-            client  = _anthropic_sdk.Anthropic(api_key=ant_key)
-            message = client.messages.create(
-                model=model or DEFAULT_ANTHROPIC_MODEL,
-                max_tokens=4096,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            ui.success("Iteration 2 plan generated via Claude")
-            return message.content[0].text
-
-        g_key = groq_key or os.getenv("GROQ_API_KEY", "")
-        if g_key:
-            payload = json.dumps({
-                "model": DEFAULT_GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-                "max_tokens": 4096,
-                "temperature": 0.3,
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                "https://api.groq.com/openai/v1/chat/completions",
-                data=payload,
-                headers={
-                    "Content-Type":  "application/json",
-                    "Authorization": f"Bearer {g_key}",
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=90) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                ui.success(f"Iteration 2 plan generated via Groq ({DEFAULT_GROQ_MODEL})")
-                return data["choices"][0]["message"]["content"]
-            except Exception as exc:
-                ui.error(f"Groq iteration call failed: {exc}")
-
-    ui.warn("No API key — returning empty iteration plan.")
-    return "No API key available for iteration 2 planning."
+    plan_dict = {
+        "idea": idea,
+        "tasks": tasks,
+        "integration_notes": (
+            "No API key was configured, so this is a generic template — not "
+            "codebase-aware beyond file/language detection. Run `supervisor "
+            "verify` on it before executing, and set ANTHROPIC_API_KEY or "
+            "GROQ_API_KEY for a plan that actually reasons about this repo."
+        ),
+    }
+    return TaskPlan.from_dict(plan_dict)
